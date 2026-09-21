@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "heimdallomarchy.monitor-layout",
+  "name": "Display layout",
+  "version": "1.0.0",
+  "author": "heimdallomarchy",
+  "license": "MIT",
+  "description": "Arrange monitors (position, mode, scale, rotation, enabled, main screen) from a drag-and-drop panel, like the Ubuntu Displays settings, and save the layout to Hyprland's monitors.lua.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Display layout",
+    "description": "One bar icon and one panel: drag monitors to reposition with edge snapping, pick resolution/scale/rotation, choose the main screen, and save the layout.",
+    "category": "Customization",
+    "aliases": ["display", "monitors", "monitor-layout"],
+    "allowMultiple": false,
+    "defaults": {}
+  }
+}
