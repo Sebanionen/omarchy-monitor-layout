@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "id": "heimdallomarchy.monitor-layout",
+  "id": "zerwiz.monitor-layout",
   "name": "Display layout",
   "version": "1.0.0",
-  "author": "heimdallomarchy",
+  "author": "zerwiz",
   "license": "MIT",
   "description": "Arrange monitors (position, mode, scale, rotation, enabled, main screen) from a drag-and-drop panel, like the Ubuntu Displays settings, and save the layout to Hyprland's monitors.lua.",
   "kinds": ["bar-widget"],
