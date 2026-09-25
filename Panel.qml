@@ -34,11 +34,20 @@ Panel {
   property string status: ""
   property bool saving: false
   property bool applying: false
+  // Set when an apply is requested while another is still running.
+  property bool applyQueued: false
+  // Status to show once the next refresh lands, so a post-apply re-read does
+  // not wipe the result message.
+  property string pendingStatus: ""
   property bool cursorActive: false
   property var overlapNames: []
   // Monitor name -> advertised mode strings. Kept out of monitorModel because
   // QQmlListModel mangles nested-array roles into opaque objects.
   property var modeOptions: ({})
+  // Monitor name -> { sdrEotf, supportsHdr, supportsWideColor, icc }.
+  // hyprctl does not read these four back, so without this a refresh would
+  // silently reset them and the next Save would write the defaults instead.
+  property var colorSticky: ({})
   property int totalCount: 0
   property int enabledCount: 0
   property string monitorSummary: "0 of 0 on"
@@ -78,7 +87,15 @@ Panel {
         description: monitorModel.get(root.selectedIndex).description,
         disabled: monitorModel.get(root.selectedIndex).disabled,
         focused: monitorModel.get(root.selectedIndex).focused,
-        availableModes: root.modeOptions[monitorModel.get(root.selectedIndex).name] || [] }
+        availableModes: root.modeOptions[monitorModel.get(root.selectedIndex).name] || [],
+        cm: monitorModel.get(root.selectedIndex).cm,
+        sdrBrightness: monitorModel.get(root.selectedIndex).sdrBrightness,
+        sdrSaturation: monitorModel.get(root.selectedIndex).sdrSaturation,
+        bitdepth: monitorModel.get(root.selectedIndex).bitdepth,
+        sdrEotf: monitorModel.get(root.selectedIndex).sdrEotf,
+        supportsHdr: monitorModel.get(root.selectedIndex).supportsHdr,
+        supportsWideColor: monitorModel.get(root.selectedIndex).supportsWideColor,
+        icc: monitorModel.get(root.selectedIndex).icc }
     : null
 
   readonly property string writeHelper: [
@@ -140,15 +157,28 @@ Panel {
 
     monitorModel.clear()
     var modes = {}
+    var sticky = {}
     for (var i = 0; i < arr.length; i++) {
       var m = arr[i]
       modes[m.name] = Mon.toArray(m.availableModes)
+      var stick = root.colorSticky[m.name]
+      if (stick) {
+        m.sdrEotf = stick.sdrEotf
+        m.supportsHdr = stick.supportsHdr
+        m.supportsWideColor = stick.supportsWideColor
+        m.icc = stick.icc
+      }
+      sticky[m.name] = { sdrEotf: m.sdrEotf, supportsHdr: m.supportsHdr,
+                        supportsWideColor: m.supportsWideColor, icc: m.icc }
       // availableModes is carried in root.modeOptions, not as a model role.
       monitorModel.append({
         name: m.name, description: m.description, x: m.x, y: m.y,
         mode: m.mode, scale: m.scale, transform: m.transform,
         logicalW: m.logicalW, logicalH: m.logicalH,
-        disabled: m.disabled, focused: m.focused
+        disabled: m.disabled, focused: m.focused,
+        cm: m.cm, sdrBrightness: m.sdrBrightness, sdrSaturation: m.sdrSaturation,
+        bitdepth: m.bitdepth, sdrEotf: m.sdrEotf, supportsHdr: m.supportsHdr,
+        supportsWideColor: m.supportsWideColor, icc: m.icc
       })
       if (m.name === keep.name) {
         monitorModel.setProperty(monitorModel.count - 1, "x", keep.x)
@@ -156,6 +186,7 @@ Panel {
       }
     }
     root.modeOptions = modes
+    root.colorSticky = sticky
 
     var on = 0
     for (var j = 0; j < monitorModel.count; j++)
@@ -166,7 +197,8 @@ Panel {
 
     if (root.selectedName !== "" && root.selectedIndex < 0) root.selectedName = ""
     if (root.selectedName === "" && monitorModel.count > 0) root.selectedName = monitorModel.get(0).name
-    root.status = monitorModel.count === 0 ? "No monitors found" : ""
+    root.status = monitorModel.count === 0 ? "No monitors found" : root.pendingStatus
+    root.pendingStatus = ""
     root.recalcCanvas()
   }
 
@@ -252,6 +284,39 @@ Panel {
     var arr = root.currentMonitors()
     for (var i = 0; i < arr.length; i++)
       if (arr[i].name === name) { writeRow(i, { disabled: !enabled }); root.applyOne(i); break }
+  }
+
+  // ---- colour ----------------------------------------------------------
+  // Colour changes go out as a colour-only rule, so they do not re-apply
+  // geometry. The four fields hyprctl cannot read back are remembered in
+  // root.colorSticky; the rest are authoritative from hyprctl.
+  function setColor(name, field, value) {
+    var i = -1
+    var arr = root.currentMonitors()
+    for (var j = 0; j < arr.length; j++) if (arr[j].name === name) { i = j; break }
+    if (i < 0) return
+    var values = {}
+    values[field] = value
+    writeRow(i, values)
+
+    var m = monitorModel.get(i)
+    var sticky = root.colorSticky[name] || {}
+    sticky.sdrEotf = m.sdrEotf
+    sticky.supportsHdr = m.supportsHdr
+    sticky.supportsWideColor = m.supportsWideColor
+    sticky.icc = m.icc
+    root.colorSticky[name] = sticky
+
+    applyColor(i)
+  }
+
+  function applyColor(i) {
+    if (applyProc.running) return
+    var m = monitorModel.get(i)
+    if (!m || m.disabled) return
+    applyProc.command = ["hyprctl", "eval", Mon.colorLuaFor(m)]
+    root.applying = true
+    applyProc.running = true
   }
 
   // ---- arrangements ----------------------------------------------------
@@ -373,9 +438,11 @@ Panel {
   }
 
   function applyAll() {
-    if (applyProc.running) return
+    // Never drop a request because one is already in flight: remember it and
+    // re-run when the current apply finishes, otherwise the button looks dead.
+    if (applyProc.running) { root.applyQueued = true; return }
     var arr = root.currentMonitors()
-    if (arr.length === 0) return
+    if (arr.length === 0) { root.status = "No monitors to apply"; return }
     var lines = []
     for (var i = 0; i < arr.length; i++) lines.push(Mon.monitorLuaFor(arr[i]))
     applyProc.command = ["hyprctl", "eval", lines.join("\n")]
@@ -501,7 +568,11 @@ Panel {
           name: m.name, mode: m.mode, resolution: res,
           rate: Mon.splitMode(m.mode).rate,
           ratesForResolution: Mon.ratesFor(modes, res),
-          modeCount: modes.length
+          modeCount: modes.length,
+          cm: m.cm, sdrEotf: m.sdrEotf,
+          sdrBrightness: m.sdrBrightness, sdrSaturation: m.sdrSaturation,
+          bitdepth: m.bitdepth, supportsHdr: m.supportsHdr,
+          supportsWideColor: m.supportsWideColor, icc: m.icc
         })
       }
       return JSON.stringify(out)
@@ -529,16 +600,36 @@ Panel {
     running: false
     command: ["true"]
 
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: function(text) {
+        var t = String(text || "").trim()
+        if (t !== "" && t !== "ok") root.status = "hyprctl: " + t
+      }
+    }
+
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: function(text) {
-        if (String(text || "").trim() !== "") root.status = "hyprctl: " + String(text).trim()
+        var t = String(text || "").trim()
+        if (t !== "") root.status = "hyprctl: " + t
       }
     }
 
     onExited: function(code) {
       root.applying = false
-      if (code === 0 && root.status.indexOf("hyprctl:") !== 0) root.status = "Layout applied"
+      if (code === 0) {
+        if (root.status.indexOf("hyprctl:") !== 0) root.pendingStatus = "Layout applied"
+        // Re-read so the panel shows what Hyprland actually took, not what we
+        // asked for; a rejected rule shows up as a mismatch here.
+        root.refresh()
+      } else if (root.status.indexOf("hyprctl:") !== 0) {
+        root.status = "Apply failed (hyprctl exit " + code + ")"
+      }
+      if (root.applyQueued) {
+        root.applyQueued = false
+        Qt.callLater(function() { root.applyAll() })
+      }
     }
   }
 
@@ -908,6 +999,255 @@ Panel {
               }
             }
 
+            // ---- colour ----
+            Rectangle {
+              width: parent.width
+              height: 1
+              color: root.line
+            }
+
+            Text {
+              width: parent.width
+              text: "Colour"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              color: root.foreground
+            }
+
+            Text {
+              width: parent.width
+              text: "Hyprland exposes presets, an SDR transfer function (gamma), brightness and saturation. It has no vibrance, contrast or hue control."
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              color: root.dim
+              wrapMode: Text.WordWrap
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.spacing.md
+
+              Column {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                Item {
+                  width: parent.width
+                  height: Style.font.caption * 1.6
+
+                  Text {
+                    id: brightnessLabel
+                    text: "Brightness"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    color: root.foreground
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+
+                  Text {
+                    text: root.sel ? brightnessSlider.liveValue.toFixed(2) : "1.00"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    color: root.dim
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+
+                PanelSlider {
+                  id: brightnessSlider
+                  width: parent.width
+                  minimum: 0.4
+                  maximum: 2
+                  step: 0.05
+                  value: root.sel ? root.sel.sdrBrightness : 1
+                  enabled: root.sel !== null && !root.sel.disabled
+                  opacity: enabled ? 1.0 : 0.5
+                  // Commit on release: a hyprctl eval per drag step would
+                  // flood the compositor and most would be dropped anyway.
+                  onReleased: function(v) {
+                    if (root.sel) root.setColor(root.sel.name, "sdrBrightness", v)
+                  }
+                }
+              }
+
+              Column {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                Item {
+                  width: parent.width
+                  height: Style.font.caption * 1.6
+
+                  Text {
+                    text: "Saturation"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    color: root.foreground
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+
+                  Text {
+                    text: root.sel ? saturationSlider.liveValue.toFixed(2) : "1.00"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    color: root.dim
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+
+                PanelSlider {
+                  id: saturationSlider
+                  width: parent.width
+                  minimum: 0
+                  maximum: 2
+                  step: 0.05
+                  value: root.sel ? root.sel.sdrSaturation : 1
+                  enabled: root.sel !== null && !root.sel.disabled
+                  opacity: enabled ? 1.0 : 0.5
+                  onReleased: function(v) {
+                    if (root.sel) root.setColor(root.sel.name, "sdrSaturation", v)
+                  }
+                }
+              }
+            }
+
+            // gamma / transfer function
+            Dropdown {
+              width: parent.width
+              showLabel: true
+              label: "Transfer function (gamma)"
+              fontFamily: root.fontFamily
+              foreground: root.foreground
+              options: [
+                { value: "default", label: "Default" },
+                { value: "gamma22", label: "Gamma 2.2" },
+                { value: "srgb", label: "sRGB piecewise" }
+              ]
+              value: root.sel ? root.sel.sdrEotf : "default"
+              onChanged: function(value) {
+                if (root.sel) root.setColor(root.sel.name, "sdrEotf", value)
+              }
+            }
+
+            // colour primaries preset
+            Dropdown {
+              width: parent.width
+              showLabel: true
+              label: "Colour preset"
+              fontFamily: root.fontFamily
+              foreground: root.foreground
+              options: [
+                { value: "auto", label: "Auto" },
+                { value: "srgb", label: "sRGB" },
+                { value: "wide", label: "Wide (BT2020)" },
+                { value: "dcip3", label: "DCI P3" },
+                { value: "dp3", label: "Display P3" },
+                { value: "adobe", label: "Adobe RGB" },
+                { value: "edid", label: "EDID" },
+                { value: "hdr", label: "HDR (experimental)" },
+                { value: "hdredid", label: "HDR + EDID (experimental)" }
+              ]
+              value: root.sel ? root.sel.cm : "srgb"
+              onChanged: function(value) {
+                if (root.sel) root.setColor(root.sel.name, "cm", value)
+              }
+            }
+
+            // bit depth + HDR + wide colour, two per row
+            Row {
+              width: parent.width
+              spacing: Style.spacing.md
+
+              Dropdown {
+                width: (parent.width - parent.spacing) / 2
+                showLabel: true
+                label: "Bit depth"
+                fontFamily: root.fontFamily
+                foreground: root.foreground
+                options: [
+                  { value: "8", label: "8 bpc" },
+                  { value: "10", label: "10 bpc" }
+                ]
+                value: root.sel ? String(root.sel.bitdepth) : "8"
+                onChanged: function(value) {
+                  if (root.sel) root.setColor(root.sel.name, "bitdepth", parseInt(value, 10))
+                }
+              }
+
+              Dropdown {
+                width: (parent.width - parent.spacing) / 2
+                showLabel: true
+                label: "HDR"
+                fontFamily: root.fontFamily
+                foreground: root.foreground
+                options: [
+                  { value: "-1", label: "Off" },
+                  { value: "0", label: "Auto" },
+                  { value: "1", label: "On" }
+                ]
+                value: root.sel ? String(root.sel.supportsHdr) : "0"
+                onChanged: function(value) {
+                  if (root.sel) root.setColor(root.sel.name, "supportsHdr", parseInt(value, 10))
+                }
+              }
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.spacing.md
+
+              Dropdown {
+                width: (parent.width - parent.spacing) / 2
+                showLabel: true
+                label: "Wide colour"
+                fontFamily: root.fontFamily
+                foreground: root.foreground
+                options: [
+                  { value: "-1", label: "Off" },
+                  { value: "0", label: "Auto" },
+                  { value: "1", label: "On" }
+                ]
+                value: root.sel ? String(root.sel.supportsWideColor) : "0"
+                onChanged: function(value) {
+                  if (root.sel) root.setColor(root.sel.name, "supportsWideColor", parseInt(value, 10))
+                }
+              }
+
+              Item { width: (parent.width - parent.spacing) / 2; height: 1 }
+            }
+
+            // ICC profile
+            Column {
+              width: parent.width
+              spacing: Style.spacing.sm
+
+              Text {
+                text: "ICC profile"
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                color: root.foreground
+              }
+
+              TextField {
+                id: iccField
+                width: parent.width
+                text: root.sel ? root.sel.icc : ""
+                placeholderText: "/home/…/profile.icc (absolute path, blank for none)"
+                foreground: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                onEditingFinished: {
+                  if (root.sel && root.sel.icc !== text)
+                    root.setColor(root.sel.name, "icc", text.trim())
+                }
+              }
+            }
+
             // actions
             Row {
               width: parent.width
@@ -943,7 +1283,7 @@ Panel {
         // ---- status + global actions ----
         Text {
           width: parent.width
-          text: root.status === "" ? "Positions apply instantly; Save writes the config file."
+          text: root.status === "" ? "Edits apply to your screens as you make them. Apply layout re-pushes the whole layout; Save writes it to the config file."
             : root.status
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

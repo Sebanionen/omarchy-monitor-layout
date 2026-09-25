@@ -11,6 +11,27 @@ function toArray(val) {
   return out
 }
 
+// Colour handling presets Hyprland's `cm` field accepts.
+var CM_PRESETS = ["auto", "srgb", "dcip3", "dp3", "adobe", "wide", "edid", "hdr", "hdredid"]
+
+// `sdr_eotf` picks the SDR transfer function, which is the closest thing
+// Hyprland has to a gamma control.
+var EOTF_PRESETS = ["default", "gamma22", "srgb"]
+
+// Hyprland states bit depth in the packed format name: "XBGR2101010" is 10bpc.
+function bitdepthOf(format) {
+  return /2101010/.test(String(format || "")) ? 10 : 8
+}
+
+function positiveFloat(value, fallback) {
+  var n = Number(value)
+  return isFinite(n) && n > 0 ? n : fallback
+}
+
+function round3(n) {
+  return Math.round(Number(n) * 1000) / 1000
+}
+
 function clone(monitor) {
   return {
     name: monitor.name,
@@ -24,7 +45,15 @@ function clone(monitor) {
     logicalH: monitor.logicalH,
     disabled: monitor.disabled,
     focused: monitor.focused,
-    availableModes: toArray(monitor.availableModes)
+    availableModes: toArray(monitor.availableModes),
+    cm: String(monitor.cm || "srgb"),
+    sdrBrightness: positiveFloat(monitor.sdrBrightness, 1),
+    sdrSaturation: positiveFloat(monitor.sdrSaturation, 1),
+    bitdepth: monitor.bitdepth === 10 ? 10 : 8,
+    sdrEotf: String(monitor.sdrEotf || "default"),
+    supportsHdr: Number(monitor.supportsHdr) || 0,
+    supportsWideColor: Number(monitor.supportsWideColor) || 0,
+    icc: String(monitor.icc || "")
   }
 }
 
@@ -104,7 +133,17 @@ function parse(raw) {
       logicalH: logicalH,
       disabled: !!m.disabled,
       focused: !!m.focused,
-      availableModes: modes
+      availableModes: modes,
+      // hyprctl reports these four; the rest are panel-side only (see
+      // Panel.qml colorSticky) because hyprctl does not read them back.
+      cm: String(m.colorManagementPreset || "srgb"),
+      sdrBrightness: positiveFloat(m.sdrBrightness, 1),
+      sdrSaturation: positiveFloat(m.sdrSaturation, 1),
+      bitdepth: bitdepthOf(m.currentFormat),
+      sdrEotf: "default",
+      supportsHdr: 0,
+      supportsWideColor: 0,
+      icc: ""
     })
   }
   return out
@@ -443,16 +482,50 @@ function sanitize(monitors) {
   return { list: list, changed: changed }
 }
 
+// Every colour field is written out explicitly, defaults included: hl.monitor
+// is cumulative, so an omitted field keeps its previous value instead of
+// falling back to the default. Writing the defaults is what lets a slider be
+// returned to normal and actually take effect. `hyprctl reload` (which Save
+// performs) resets anything the config file does not mention.
+//
+// `icc` is the exception: Hyprland rejects an empty path, so it is only
+// written when set. Clearing a profile means saving without it and reloading.
+function colorFieldsFor(m) {
+  var parts = [
+    "cm = \"" + (m.cm || "srgb") + "\"",
+    "sdr_eotf = \"" + (m.sdrEotf || "default") + "\"",
+    "sdrbrightness = " + round3(positiveFloat(m.sdrBrightness, 1)),
+    "sdrsaturation = " + round3(positiveFloat(m.sdrSaturation, 1)),
+    "bitdepth = " + (m.bitdepth === 10 ? 10 : 8),
+    "supports_hdr = " + (Number(m.supportsHdr) || 0),
+    "supports_wide_color = " + (Number(m.supportsWideColor) || 0)
+  ]
+  var icc = String(m.icc || "")
+  if (icc !== "") parts.push("icc = \"" + icc + "\"")
+  return parts
+}
+
 // One `hl.monitor({...})` line for a single monitor, shared by the config
 // writer and the live-apply path.
 function monitorLuaFor(m) {
   if (m.disabled) return "hl.monitor({ output = \"" + m.name + "\", disabled = true })"
-  var parts = []
-  parts.push("output = \"" + m.name + "\"")
-  parts.push("mode = \"" + m.mode + "\"")
-  parts.push("position = \"" + Math.round(m.x) + "x" + Math.round(m.y) + "\"")
-  parts.push("scale = " + m.scale)
+  var parts = ["output = \"" + m.name + "\"", "mode = \"" + m.mode + "\"",
+    "position = \"" + Math.round(m.x) + "x" + Math.round(m.y) + "\"",
+    "scale = " + m.scale]
   if (m.transform % 4 !== 0) parts.push("transform = " + (m.transform % 4))
+  var color = colorFieldsFor(m)
+  for (var i = 0; i < color.length; i++) parts.push(color[i])
+  return "hl.monitor({ " + parts.join(", ") + " })"
+}
+
+// Colour-only rule, so nudging a colour control does not also re-apply
+// geometry (and vice versa).
+function colorLuaFor(m) {
+  if (!m) return ""
+  if (m.disabled) return "hl.monitor({ output = \"" + m.name + "\", disabled = true })"
+  var parts = ["output = \"" + m.name + "\""]
+  var color = colorFieldsFor(m)
+  for (var i = 0; i < color.length; i++) parts.push(color[i])
   return "hl.monitor({ " + parts.join(", ") + " })"
 }
 
