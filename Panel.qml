@@ -36,6 +36,9 @@ Panel {
   property bool applying: false
   property bool cursorActive: false
   property var overlapNames: []
+  // Monitor name -> advertised mode strings. Kept out of monitorModel because
+  // QQmlListModel mangles nested-array roles into opaque objects.
+  property var modeOptions: ({})
   property int totalCount: 0
   property int enabledCount: 0
   property string monitorSummary: "0 of 0 on"
@@ -75,7 +78,7 @@ Panel {
         description: monitorModel.get(root.selectedIndex).description,
         disabled: monitorModel.get(root.selectedIndex).disabled,
         focused: monitorModel.get(root.selectedIndex).focused,
-        availableModes: monitorModel.get(root.selectedIndex).availableModes }
+        availableModes: root.modeOptions[monitorModel.get(root.selectedIndex).name] || [] }
     : null
 
   readonly property string writeHelper: [
@@ -136,14 +139,23 @@ Panel {
       keep = monitorModel.get(root.selectedIndex)
 
     monitorModel.clear()
+    var modes = {}
     for (var i = 0; i < arr.length; i++) {
       var m = arr[i]
-      monitorModel.append(m)
+      modes[m.name] = Mon.toArray(m.availableModes)
+      // availableModes is carried in root.modeOptions, not as a model role.
+      monitorModel.append({
+        name: m.name, description: m.description, x: m.x, y: m.y,
+        mode: m.mode, scale: m.scale, transform: m.transform,
+        logicalW: m.logicalW, logicalH: m.logicalH,
+        disabled: m.disabled, focused: m.focused
+      })
       if (m.name === keep.name) {
         monitorModel.setProperty(monitorModel.count - 1, "x", keep.x)
         monitorModel.setProperty(monitorModel.count - 1, "y", keep.y)
       }
     }
+    root.modeOptions = modes
 
     var on = 0
     for (var j = 0; j < monitorModel.count; j++)
@@ -224,11 +236,22 @@ Panel {
     }
   }
 
-  function setEnabled(name, enabled) {
+  // Change only the refresh rate, keeping the current resolution.
+  function setRate(name, rate) {
     var arr = root.currentMonitors()
     for (var i = 0; i < arr.length; i++) {
-      if (arr[i].name === name) { writeRow(i, { disabled: !enabled }); root.applyOne(i); break }
+      if (arr[i].name !== name) continue
+      var res = Mon.splitMode(arr[i].mode).res
+      if (res === "") res = Mon.splitMode(root.modeOptions[name] ? root.modeOptions[name][0] : "").res
+      root.setMode(name, Mon.modeFor(res, rate))
+      return
     }
+  }
+
+  function setEnabled(name, enabled) {
+    var arr = root.currentMonitors()
+    for (var i = 0; i < arr.length; i++)
+      if (arr[i].name === name) { writeRow(i, { disabled: !enabled }); root.applyOne(i); break }
   }
 
   // ---- arrangements ----------------------------------------------------
@@ -338,25 +361,24 @@ Panel {
   }
 
   // ---- apply -----------------------------------------------------------
+  // Hyprland 0.56 dropped the legacy parser, so `hyprctl keyword` is rejected;
+  // runtime changes go through `hyprctl eval` with the config's Lua syntax.
   function applyOne(index) {
     if (applyProc.running) return
-    var cmd = Mon.keywordString(root.currentMonitors(), index)
-    if (cmd === "") return
-    applyProc.command = ["sh", "-c", "hyprctl keyword monitor " + cmd]
+    var lua = Mon.monitorLuaFor(root.currentMonitors()[index])
+    if (!lua) return
+    applyProc.command = ["hyprctl", "eval", lua]
     root.applying = true
     applyProc.running = true
   }
 
   function applyAll() {
     if (applyProc.running) return
-    var cmds = []
     var arr = root.currentMonitors()
-    for (var i = 0; i < arr.length; i++) {
-      var cmd = Mon.keywordString(arr, i)
-      if (cmd !== "") cmds.push("hyprctl keyword monitor " + cmd)
-    }
-    if (cmds.length === 0) return
-    applyProc.command = ["sh", "-c", cmds.join("; ")]
+    if (arr.length === 0) return
+    var lines = []
+    for (var i = 0; i < arr.length; i++) lines.push(Mon.monitorLuaFor(arr[i]))
+    applyProc.command = ["hyprctl", "eval", lines.join("\n")]
     root.applying = true
     applyProc.running = true
   }
@@ -469,7 +491,21 @@ Panel {
     function toggle(): void { root.toggle() }
     function refresh(): string { root.refresh(); return "ok" }
     function save(): string { root.saveConfig(); return "ok" }
-    function dump(): string { return JSON.stringify(root.currentMonitors()) }
+    function dump(): string {
+      var out = []
+      for (var i = 0; i < monitorModel.count; i++) {
+        var m = monitorModel.get(i)
+        var modes = root.modeOptions[m.name] || []
+        var res = Mon.splitMode(m.mode).res
+        out.push({
+          name: m.name, mode: m.mode, resolution: res,
+          rate: Mon.splitMode(m.mode).rate,
+          ratesForResolution: Mon.ratesFor(modes, res),
+          modeCount: modes.length
+        })
+      }
+      return JSON.stringify(out)
+    }
   }
 
   // ---- processes -------------------------------------------------------
@@ -828,6 +864,23 @@ Panel {
               value: root.sel ? root.sel.mode : ""
               onChanged: function(value) {
                 if (root.sel) root.setMode(root.sel.name, value)
+              }
+            }
+
+            // refresh rate, restricted to the rates the chosen resolution offers
+            Dropdown {
+              width: parent.width
+              showLabel: true
+              label: "Refresh rate"
+              fontFamily: root.fontFamily
+              foreground: root.foreground
+              options: root.sel
+                ? Mon.ratesFor(root.sel.availableModes, Mon.splitMode(root.sel.mode).res)
+                    .map(function(r) { return { value: r, label: r + " Hz" } })
+                : []
+              value: root.sel ? Mon.splitMode(root.sel.mode).rate : ""
+              onChanged: function(value) {
+                if (root.sel) root.setRate(root.sel.name, value)
               }
             }
 
