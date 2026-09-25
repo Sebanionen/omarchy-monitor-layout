@@ -180,3 +180,13 @@ If a saved layout is bad, restore the previous file:
 cp ~/.config/hypr/monitors.lua.backup ~/.config/hypr/monitors.lua
 hyprctl reload
 ```
+
+## License
+
+Released under the [MIT License](LICENSE). Copyright (c) 2026 zerwiz.
+
+## Contributors
+
+See [CONTRIBUTORS.md](CONTRIBUTORS.md). Thanks to **Sebanionen** for Hyprland
+0.56 support, the refresh-rate control, and the apply / mode-list / refresh
+readback fixes.
